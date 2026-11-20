@@ -16,6 +16,42 @@ first was the original fault; the other two were created during the recovery.
 | 2 | Crash records in the boot flash's fault table. Any record whose first word has a top nibble of 3 or more makes the front end choose TROUBLE mode at every boot. | Added by this work: each firmware assert or crash during the experiments wrote one. | Program one byte per record (0x4x to 0x0x) on the flash chip. This only clears bits, so no erase is needed. |
 | 3 | The back end had no namespace 1, while the front end still listed one. The first host READ made the hardware lookup unit raise an error the firmware does not handle (assert 0x04030009), and the drive reset itself into TROUBLE. | Side effect of fix 1: first-time init gives all capacity to the free pool. | Delete and recreate the namespace with admin commands only, before any read reaches the drive. |
 
+## Anatomy of the failure
+
+**How the drive keeps its state.** The NAND manager (back end) holds its mapping tables in RAM. On
+NAND it keeps a base snapshot plus a journal of changes since. At a clean shutdown, or on power
+loss using the capacitors, it dumps the RAM tables and writes a "commit" record. At the next boot
+it clears that marker, so a running drive is always "open".
+
+**What was found.** The boot-time scan found its root, loaded the snapshot and replayed all 541
+journal pages without a read error or a retry. The last journal page ended with an end marker but
+no commit record. So after its last good boot the drive lost power or was reset, and the final dump
+never completed.
+
+**Why that was fatal.** The firmware has no fallback. Without the commit it reports "no usable
+checkpoint" and the front end starts the back end in TROUBLE mode, where it serves no reads and
+persists nothing. That is why every counter was frozen and why format, sanitize and even a firmware
+update had no lasting effect: nothing was ever written down. Presumably this is deliberate: without
+the dump the tables may be subtly wrong, and an enterprise drive stops rather than risk returning
+wrong data.
+
+**Why the dump did not happen.** Not established. The evidence narrows it down:
+
+- Probably not the capacitors: the power-loss rail read about 29.8 V, capacitor status was NORMAL,
+  and the dump worked on every sudden power cut after the revival.
+- Not worn-out NAND: nothing was unreadable and `media_errors` is 0.
+- Candidate 1, a firmware hang followed by a power cycle. A hung back end cannot run its dump
+  however healthy the capacitors are. The boot flash held two firmware assert records that predate
+  this work (one in system-area setup, one in an I2C routine). They are undated.
+- Candidate 2, power lost during a back-end restart. The drive's saved log shows 50 back-end
+  restarts in its last working period, each caused by the host sending an NVMe power-state change
+  (Set Features, power management). Each restart is a window in which the back end may not be able
+  to dump.
+- The drive had survived 265 unsafe shutdowns before this, so plain power loss alone does not
+  usually do it.
+
+A practical consequence of candidate 2: consider keeping this drive out of NVMe low-power states.
+
 ## What we did, in order
 
 1. **Software routes (September, 12-13 November).** Format, sanitize, namespace delete, HPE firmware
@@ -114,6 +150,9 @@ at console address 0x20830000, repeat step 3, then clear byte 3 of the new recor
 - **Shut down cleanly.** Its power-loss dump worked every time it was tested today, but an
   unfinished one is what killed it originally.
 - **A relapse needs the bench again**, and the recovery wipes the drive.
+- **Firmware was left at HPK0.** The recovery scripts patch RAM addresses that are specific to this
+  build, so after an update to HPK3 the recipe above would no longer apply if the drive relapsed.
+  HPE's release note for HPK3 says only "maintenance firmware release".
 - The debug monitor is still in its restricted mode; nothing about the lock was changed.
 - The boot flash still holds 18 neutralised fault records. They are harmless.
 
